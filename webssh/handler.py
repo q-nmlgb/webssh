@@ -12,6 +12,7 @@ import pty
 import fcntl
 import termios
 import uuid
+import threading # 新增：用于多线程并发读取
 
 from concurrent.futures import ThreadPoolExecutor
 from tornado.ioloop import IOLoop
@@ -46,7 +47,7 @@ class InvalidValueError(Exception):
 
 
 # =====================================================================
-# 新增：本地伪终端 Mock 核心类，免除 SSH 依赖直连本地 Bash/Sh
+# 核心修复：基于多线程的伪终端 Mock 核心类
 # =====================================================================
 class LocalChan(object):
     """模拟 Paramiko Channel，提供窗口大小自适应能力"""
@@ -62,7 +63,7 @@ class LocalChan(object):
 
 
 class LocalWorker(object):
-    """模拟 webssh Worker，直接桥接 PTY 管道与 Tornado IOLoop"""
+    """通过后台守护线程直接对 PTY 进行阻塞读写，完全避免 Tornado Event Loop 的文件描述符兼容性问题"""
     def __init__(self, loop, fd, pid):
         self.loop = loop
         self.fd = fd
@@ -71,45 +72,54 @@ class LocalWorker(object):
         self.chan = LocalChan(fd)
         self.closed = False
         self.encoding = 'utf-8'
-        self.data_to_dst = []
         self.handler = None
         self.src_addr = None
+
+        # 启动后台阻塞读取线程
+        self.read_thread = threading.Thread(target=self._loop_read, daemon=True)
+        self.read_thread.start()
 
     def set_handler(self, handler):
         self.handler = handler
 
-    def __call__(self, fd, events):
+    def _loop_read(self):
+        """后台线程：同步阻塞读取 PTY 数据"""
+        while not self.closed:
+            try:
+                # 阻塞式读取，对 TTY 极其稳定
+                data = os.read(self.fd, 65536)
+                if not data:
+                    self.loop.add_callback(self.close, 'EOF')
+                    break
+                
+                # 只有在前端 WebSocket 连接准备好后才投递数据
+                if self.handler:
+                    self.loop.add_callback(self._send_to_client, data)
+            except (OSError, IOError) as e:
+                self.loop.add_callback(self.close, f"Read Error: {e}")
+                break
+
+    def _send_to_client(self, data):
+        """在 Tornado 主线程中发送 WebSocket 消息"""
+        if self.closed or not self.handler:
+            return
+        try:
+            # 优先使用 text 传输，不兼容时降级为二进制传输
+            self.handler.write_message(data.decode(self.encoding, errors='ignore'))
+        except Exception:
+            try:
+                self.handler.write_message(data, binary=True)
+            except Exception:
+                pass
+
+    def write_to_fd(self, data):
+        """写入用户输入到 PTY"""
         if self.closed:
             return
-        if events & IOLoop.READ:
-            self.on_read()
-        if events & IOLoop.WRITE:
-            self.on_write()
-
-    def on_read(self):
         try:
-            data = os.read(self.fd, 65536)
-            if not data:
-                self.close(reason='EOF')
-                return
-            if self.handler:
-                try:
-                    # 优先使用 text 传输，不兼容时降级为二进制传输
-                    self.handler.write_message(data.decode(self.encoding, errors='ignore'))
-                except Exception:
-                    self.handler.write_message(data, binary=True)
-        except (OSError, IOError):
-            self.close(reason='IOError')
-
-    def on_write(self):
-        if not self.data_to_dst:
-            return
-        try:
-            while self.data_to_dst:
-                data = self.data_to_dst.pop(0)
-                os.write(self.fd, data.encode(self.encoding, errors='ignore'))
-        except (OSError, IOError):
-            self.close(reason='Write error')
+            os.write(self.fd, data.encode(self.encoding, errors='ignore'))
+        except (OSError, IOError) as e:
+            self.close(reason=f"Write error: {e}")
 
     def close(self, reason=None):
         if self.closed:
@@ -117,11 +127,10 @@ class LocalWorker(object):
         self.closed = True
         logging.info(f"Local session {self.id} closed. Reason: {reason}")
         if self.handler:
-            self.handler.close(reason=reason)
-        try:
-            self.loop.remove_handler(self.fd)
-        except Exception:
-            pass
+            try:
+                self.handler.close(reason=reason)
+            except Exception:
+                pass
         try:
             os.close(self.fd)
         except Exception:
@@ -134,12 +143,10 @@ class LocalWorker(object):
 
 
 class SSHClient(paramiko.SSHClient):
-    # 保留原定义，防止未使用的引用报错
     pass
 
 
 class PrivateKey(object):
-    # 保留原定义，防止未使用的引用报错
     def __init__(self, privatekey, password=None, filename=''):
         self.privatekey = privatekey
 
@@ -296,7 +303,6 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
         else:
             super(IndexHandler, self).write_error(status_code, **kwargs)
 
-    # 绕过原有的校验逻辑，直接赋予默认值以兼容前端表单
     def get_hostname(self):
         return "localhost"
 
@@ -307,24 +313,27 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
         return ("localhost", DEFAULT_PORT, "localuser", "", None)
 
     # =====================================================================
-    # 核心修改：覆写 ssh_connect，拦截远程连接，直接在容器内 Fork 出 Local Shell
+    # 核心修改：以交互式启动本地 Shell 并支持 TERM 环境
     # =====================================================================
     def ssh_connect(self, args):
-        logging.info("Bypassing SSH. Spawning local shell in container...")
+        logging.info("Bypassing SSH. Spawning local interactive shell in container...")
         try:
             pid, fd = pty.fork()
             if pid == 0:
-                # 子进程：尝试加载 bash，失败则降级到 sh
-                try:
-                    os.execvp("bash", ["bash"])
-                except Exception:
-                    os.execvp("sh", ["sh"])
-            else:
-                # 父进程：配置 PTY 文件描述符为非阻塞
-                fl = fcntl.fcntl(fd, fcntl.F_GETFL)
-                fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+                # 1. 声明终端环境变量以完美支持 xterm.js 的控制序列渲染
+                os.environ["TERM"] = "xterm-256color"
                 
-                # 创建本地进程包装的 Worker
+                # 2. 启动交互式 shell (加上 -i 确保它输出 Prompt，比如 user@host:~$)
+                try:
+                    os.execvp("bash", ["bash", "-i"])
+                except Exception:
+                    try:
+                        os.execvp("sh", ["sh", "-i"])
+                    except Exception as err:
+                        logging.error(f"Failed to execute shells: {err}")
+                        os._exit(1)
+            else:
+                # 在父进程中不设置 O_NONBLOCK，使得同步后台读取线程能够安全工作
                 worker = LocalWorker(self.loop, fd, pid)
                 worker.encoding = 'utf-8'
                 return worker
@@ -413,7 +422,7 @@ class WsockHandler(MixinHandler, tornado.websocket.WebSocketHandler):
                 self.set_nodelay(True)
                 worker.set_handler(self)
                 self.worker_ref = weakref.ref(worker)
-                self.loop.add_handler(worker.fd, worker, IOLoop.READ)
+                # 核心改变：不再使用 loop.add_handler(worker.fd...) 托管给 Tornado，读取由 LocalWorker 自己的后台守护线程完成
             else:
                 self.close(reason='Websocket authentication failed.')
 
@@ -450,8 +459,8 @@ class WsockHandler(MixinHandler, tornado.websocket.WebSocketHandler):
 
         data = msg.get('data')
         if data and isinstance(data, UnicodeType):
-            worker.data_to_dst.append(data)
-            worker.on_write()
+            # 核心改变：直接向 PTY 写入
+            worker.write_to_fd(data)
 
     def on_close(self):
         logging.info('Disconnected from {}:{}'.format(*self.src_addr))
