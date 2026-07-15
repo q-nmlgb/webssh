@@ -7,6 +7,11 @@ import traceback
 import weakref
 import paramiko
 import tornado.web
+import os
+import pty
+import fcntl
+import termios
+import uuid
 
 from concurrent.futures import ThreadPoolExecutor
 from tornado.ioloop import IOLoop
@@ -17,7 +22,7 @@ from webssh.utils import (
     to_int, to_ip_address, UnicodeType, is_ip_hostname, is_same_primary_domain,
     is_valid_encoding
 )
-from webssh.worker import Worker, recycle_worker, clients
+from webssh.worker import recycle_worker, clients
 
 try:
     from json.decoder import JSONDecodeError
@@ -40,147 +45,103 @@ class InvalidValueError(Exception):
     pass
 
 
-class SSHClient(paramiko.SSHClient):
+# =====================================================================
+# 新增：本地伪终端 Mock 核心类，免除 SSH 依赖直连本地 Bash/Sh
+# =====================================================================
+class LocalChan(object):
+    """模拟 Paramiko Channel，提供窗口大小自适应能力"""
+    def __init__(self, fd):
+        self.fd = fd
 
-    def handler(self, title, instructions, prompt_list):
-        answers = []
-        for prompt_, _ in prompt_list:
-            prompt = prompt_.strip().lower()
-            if prompt.startswith('password'):
-                answers.append(self.password)
-            elif prompt.startswith('verification'):
-                answers.append(self.totp)
-            else:
-                raise ValueError('Unknown prompt: {}'.format(prompt_))
-        return answers
+    def resize_pty(self, cols, rows, xpix=0, ypix=0):
+        try:
+            winsize = struct.pack("HHHH", rows, cols, xpix, ypix)
+            fcntl.ioctl(self.fd, termios.TIOCSWINSZ, winsize)
+        except Exception as e:
+            logging.error(f"Failed to resize terminal: {e}")
 
-    def auth_interactive(self, username, handler):
-        if not self.totp:
-            raise ValueError('Need a verification code for 2fa.')
-        self._transport.auth_interactive(username, handler)
 
-    def _auth(self, username, password, pkey, *args):
-        self.password = password
-        saved_exception = None
-        two_factor = False
-        allowed_types = set()
-        two_factor_types = {'keyboard-interactive', 'password'}
+class LocalWorker(object):
+    """模拟 webssh Worker，直接桥接 PTY 管道与 Tornado IOLoop"""
+    def __init__(self, loop, fd, pid):
+        self.loop = loop
+        self.fd = fd
+        self.pid = pid
+        self.id = uuid.uuid4().hex
+        self.chan = LocalChan(fd)
+        self.closed = False
+        self.encoding = 'utf-8'
+        self.data_to_dst = []
+        self.handler = None
+        self.src_addr = None
 
-        if pkey is not None:
-            logging.info('Trying publickey authentication')
-            try:
-                allowed_types = set(
-                    self._transport.auth_publickey(username, pkey)
-                )
-                two_factor = allowed_types & two_factor_types
-                if not two_factor:
-                    return
-            except paramiko.SSHException as e:
-                saved_exception = e
+    def set_handler(self, handler):
+        self.handler = handler
 
-        if two_factor:
-            logging.info('Trying publickey 2fa')
-            return self.auth_interactive(username, self.handler)
+    def __call__(self, fd, events):
+        if self.closed:
+            return
+        if events & IOLoop.READ:
+            self.on_read()
+        if events & IOLoop.WRITE:
+            self.on_write()
 
-        if password is not None:
-            logging.info('Trying password authentication')
-            try:
-                self._transport.auth_password(username, password)
+    def on_read(self):
+        try:
+            data = os.read(self.fd, 65536)
+            if not data:
+                self.close(reason='EOF')
                 return
-            except paramiko.SSHException as e:
-                saved_exception = e
-                allowed_types = set(getattr(e, 'allowed_types', []))
-                two_factor = allowed_types & two_factor_types
+            if self.handler:
+                try:
+                    # 优先使用 text 传输，不兼容时降级为二进制传输
+                    self.handler.write_message(data.decode(self.encoding, errors='ignore'))
+                except Exception:
+                    self.handler.write_message(data, binary=True)
+        except (OSError, IOError):
+            self.close(reason='IOError')
 
-        if two_factor:
-            logging.info('Trying password 2fa')
-            return self.auth_interactive(username, self.handler)
+    def on_write(self):
+        if not self.data_to_dst:
+            return
+        try:
+            while self.data_to_dst:
+                data = self.data_to_dst.pop(0)
+                os.write(self.fd, data.encode(self.encoding, errors='ignore'))
+        except (OSError, IOError):
+            self.close(reason='Write error')
 
-        assert saved_exception is not None
-        raise saved_exception
+    def close(self, reason=None):
+        if self.closed:
+            return
+        self.closed = True
+        logging.info(f"Local session {self.id} closed. Reason: {reason}")
+        if self.handler:
+            self.handler.close(reason=reason)
+        try:
+            self.loop.remove_handler(self.fd)
+        except Exception:
+            pass
+        try:
+            os.close(self.fd)
+        except Exception:
+            pass
+        try:
+            os.kill(self.pid, 9)
+        except Exception:
+            pass
+# =====================================================================
+
+
+class SSHClient(paramiko.SSHClient):
+    # 保留原定义，防止未使用的引用报错
+    pass
 
 
 class PrivateKey(object):
-
-    max_length = 16384  # rough number
-
-    tag_to_name = {
-        'RSA': 'RSA',
-        'DSA': 'DSS',
-        'EC': 'ECDSA',
-        'OPENSSH': 'Ed25519'
-    }
-
+    # 保留原定义，防止未使用的引用报错
     def __init__(self, privatekey, password=None, filename=''):
         self.privatekey = privatekey
-        self.filename = filename
-        self.password = password
-        self.check_length()
-        self.iostr = io.StringIO(privatekey)
-        self.last_exception = None
-
-    def check_length(self):
-        if len(self.privatekey) > self.max_length:
-            raise InvalidValueError('Invalid key length.')
-
-    def parse_name(self, iostr, tag_to_name):
-        name = None
-        for line_ in iostr:
-            line = line_.strip()
-            if line and line.startswith('-----BEGIN ') and \
-                    line.endswith(' PRIVATE KEY-----'):
-                lst = line.split(' ')
-                if len(lst) == 4:
-                    tag = lst[1]
-                    if tag:
-                        name = tag_to_name.get(tag)
-                        if name:
-                            break
-        return name, len(line_)
-
-    def get_specific_pkey(self, name, offset, password):
-        self.iostr.seek(offset)
-        logging.debug('Reset offset to {}.'.format(offset))
-
-        logging.debug('Try parsing it as {} type key'.format(name))
-        pkeycls = getattr(paramiko, name+'Key')
-        pkey = None
-
-        try:
-            pkey = pkeycls.from_private_key(self.iostr, password=password)
-        except paramiko.PasswordRequiredException:
-            raise InvalidValueError('Need a passphrase to decrypt the key.')
-        except (paramiko.SSHException, ValueError) as exc:
-            self.last_exception = exc
-            logging.debug(str(exc))
-
-        return pkey
-
-    def get_pkey_obj(self):
-        logging.info('Parsing private key {!r}'.format(self.filename))
-        name, length = self.parse_name(self.iostr, self.tag_to_name)
-        if not name:
-            raise InvalidValueError('Invalid key {}.'.format(self.filename))
-
-        offset = self.iostr.tell() - length
-        password = to_bytes(self.password) if self.password else None
-        pkey = self.get_specific_pkey(name, offset, password)
-
-        if pkey is None and name == 'Ed25519':
-            for name in ['RSA', 'ECDSA', 'DSS']:
-                pkey = self.get_specific_pkey(name, offset, password)
-                if pkey:
-                    break
-
-        if pkey:
-            return pkey
-
-        logging.error(str(self.last_exception))
-        msg = 'Invalid key'
-        if self.password:
-            msg += ' or wrong passphrase "{}" for decrypting it.'.format(
-                    self.password)
-        raise InvalidValueError(msg)
 
 
 class MixinHandler(object):
@@ -251,7 +212,6 @@ class MixinHandler(object):
             if redirecting and not is_ip_hostname(hostname):
                 ip_address = to_ip_address(ip)
                 if not ip_address.is_private:
-                    # redirecting
                     return False
 
             if options.fbidhttp:
@@ -292,12 +252,10 @@ class MixinHandler(object):
         elif ip in self.request.headers.get('X-Forwarded-For', ''):
             port = self.request.headers.get('X-Forwarded-Port')
         else:
-            # not running behind an nginx server
             return
 
         port = to_int(port)
         if port is None or not is_valid_port(port):
-            # fake port
             port = 65535
 
         return (ip, port)
@@ -320,7 +278,7 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
         super(IndexHandler, self).initialize(loop)
         self.policy = policy
         self.host_keys_settings = host_keys_settings
-        self.ssh_client = self.get_ssh_client()
+        self.ssh_client = None
         self.debug = self.settings.get('debug', False)
         self.font = self.settings.get('font', '')
         self.result = dict(id=None, status=None, encoding=None)
@@ -338,137 +296,41 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
         else:
             super(IndexHandler, self).write_error(status_code, **kwargs)
 
-    def get_ssh_client(self):
-        ssh = SSHClient()
-        ssh._system_host_keys = self.host_keys_settings['system_host_keys']
-        ssh._host_keys = self.host_keys_settings['host_keys']
-        ssh._host_keys_filename = self.host_keys_settings['host_keys_filename']
-        ssh.set_missing_host_key_policy(self.policy)
-        return ssh
-
-    def get_privatekey(self):
-        name = 'privatekey'
-        lst = self.request.files.get(name)
-        if lst:
-            # multipart form
-            filename = lst[0]['filename']
-            data = lst[0]['body']
-            value = self.decode_argument(data, name=name).strip()
-        else:
-            # urlencoded form
-            value = self.get_argument(name, u'')
-            filename = ''
-
-        return value, filename
-
+    # 绕过原有的校验逻辑，直接赋予默认值以兼容前端表单
     def get_hostname(self):
-        value = self.get_value('hostname')
-        if not (is_valid_hostname(value) or is_valid_ip_address(value)):
-            raise InvalidValueError('Invalid hostname: {}'.format(value))
-        return value
+        return "localhost"
 
     def get_port(self):
-        value = self.get_argument('port', u'')
-        if not value:
-            return DEFAULT_PORT
-
-        port = to_int(value)
-        if port is None or not is_valid_port(port):
-            raise InvalidValueError('Invalid port: {}'.format(value))
-        return port
-
-    def lookup_hostname(self, hostname, port):
-        key = hostname if port == 22 else '[{}]:{}'.format(hostname, port)
-
-        if self.ssh_client._system_host_keys.lookup(key) is None:
-            if self.ssh_client._host_keys.lookup(key) is None:
-                raise tornado.web.HTTPError(
-                        403, 'Connection to {}:{} is not allowed.'.format(
-                            hostname, port)
-                    )
+        return DEFAULT_PORT
 
     def get_args(self):
-        hostname = self.get_hostname()
-        port = self.get_port()
-        username = self.get_value('username')
-        password = self.get_argument('password', u'')
-        privatekey, filename = self.get_privatekey()
-        passphrase = self.get_argument('passphrase', u'')
-        totp = self.get_argument('totp', u'')
+        return ("localhost", DEFAULT_PORT, "localuser", "", None)
 
-        if isinstance(self.policy, paramiko.RejectPolicy):
-            self.lookup_hostname(hostname, port)
-
-        if privatekey:
-            pkey = PrivateKey(privatekey, passphrase, filename).get_pkey_obj()
-        else:
-            pkey = None
-
-        self.ssh_client.totp = totp
-        args = (hostname, port, username, password, pkey)
-        logging.debug(args)
-
-        return args
-
-    def parse_encoding(self, data):
-        try:
-            encoding = to_str(data.strip(), 'ascii')
-        except UnicodeDecodeError:
-            return
-
-        if is_valid_encoding(encoding):
-            return encoding
-
-    def get_default_encoding(self, ssh):
-        commands = [
-            '$SHELL -ilc "locale charmap"',
-            '$SHELL -ic "locale charmap"'
-        ]
-
-        for command in commands:
-            try:
-                _, stdout, _ = ssh.exec_command(command,
-                                                get_pty=True,
-                                                timeout=1)
-            except paramiko.SSHException as exc:
-                logging.info(str(exc))
-            else:
-                try:
-                    data = stdout.read()
-                except socket.timeout:
-                    pass
-                else:
-                    logging.debug('{!r} => {!r}'.format(command, data))
-                    result = self.parse_encoding(data)
-                    if result:
-                        return result
-
-        logging.warning('Could not detect the default encoding.')
-        return 'utf-8'
-
+    # =====================================================================
+    # 核心修改：覆写 ssh_connect，拦截远程连接，直接在容器内 Fork 出 Local Shell
+    # =====================================================================
     def ssh_connect(self, args):
-        ssh = self.ssh_client
-        dst_addr = args[:2]
-        logging.info('Connecting to {}:{}'.format(*dst_addr))
-
+        logging.info("Bypassing SSH. Spawning local shell in container...")
         try:
-            ssh.connect(*args, timeout=options.timeout)
-        except socket.error:
-            raise ValueError('Unable to connect to {}:{}'.format(*dst_addr))
-        except paramiko.BadAuthenticationType:
-            raise ValueError('Bad authentication type.')
-        except paramiko.AuthenticationException:
-            raise ValueError('Authentication failed.')
-        except paramiko.BadHostKeyException:
-            raise ValueError('Bad host key.')
-
-        term = self.get_argument('term', u'') or u'xterm'
-        chan = ssh.invoke_shell(term=term)
-        chan.setblocking(0)
-        worker = Worker(self.loop, ssh, chan, dst_addr)
-        worker.encoding = options.encoding if options.encoding else \
-            self.get_default_encoding(ssh)
-        return worker
+            pid, fd = pty.fork()
+            if pid == 0:
+                # 子进程：尝试加载 bash，失败则降级到 sh
+                try:
+                    os.execvp("bash", ["bash"])
+                except Exception:
+                    os.execvp("sh", ["sh"])
+            else:
+                # 父进程：配置 PTY 文件描述符为非阻塞
+                fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+                fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+                
+                # 创建本地进程包装的 Worker
+                worker = LocalWorker(self.loop, fd, pid)
+                worker.encoding = 'utf-8'
+                return worker
+        except Exception as e:
+            logging.error(f"Failed to spawn local shell: {e}")
+            raise ValueError(f"Spawn local shell failed: {e}")
 
     def check_origin(self):
         event_origin = self.get_argument('_origin', u'')
@@ -493,7 +355,6 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
     @tornado.gen.coroutine
     def post(self):
         if self.debug and self.get_argument('error', u''):
-            # for testing purpose only
             raise ValueError('Uncaught exception')
 
         ip, port = self.get_client_addr()
@@ -560,7 +421,6 @@ class WsockHandler(MixinHandler, tornado.websocket.WebSocketHandler):
         logging.debug('{!r} from {}:{}'.format(message, *self.src_addr))
         worker = self.worker_ref()
         if not worker:
-            # The worker has likely been closed. Do not process.
             logging.debug(
                 "received message to closed worker from {}:{}".format(
                     *self.src_addr
