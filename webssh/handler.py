@@ -12,7 +12,7 @@ import pty
 import fcntl
 import termios
 import uuid
-import threading # 新增：用于多线程并发读取
+import threading
 
 from concurrent.futures import ThreadPoolExecutor
 from tornado.ioloop import IOLoop
@@ -47,10 +47,9 @@ class InvalidValueError(Exception):
 
 
 # =====================================================================
-# 核心修复：基于多线程的伪终端 Mock 核心类
+# 核心调试版：本地伪终端 Mock 核心类
 # =====================================================================
 class LocalChan(object):
-    """模拟 Paramiko Channel，提供窗口大小自适应能力"""
     def __init__(self, fd):
         self.fd = fd
 
@@ -58,12 +57,12 @@ class LocalChan(object):
         try:
             winsize = struct.pack("HHHH", rows, cols, xpix, ypix)
             fcntl.ioctl(self.fd, termios.TIOCSWINSZ, winsize)
+            logging.info(f"[DEBUG-TTY] Resized window to cols={cols}, rows={rows}")
         except Exception as e:
-            logging.error(f"Failed to resize terminal: {e}")
+            logging.error(f"[DEBUG-TTY] Failed to resize terminal: {e}")
 
 
 class LocalWorker(object):
-    """通过后台守护线程直接对 PTY 进行阻塞读写，完全避免 Tornado Event Loop 的文件描述符兼容性问题"""
     def __init__(self, loop, fd, pid):
         self.loop = loop
         self.fd = fd
@@ -75,57 +74,62 @@ class LocalWorker(object):
         self.handler = None
         self.src_addr = None
 
-        # 启动后台阻塞读取线程
+        logging.info(f"[DEBUG-TTY] LocalWorker initialized. PID={self.pid}, FD={self.fd}. Starting read thread...")
         self.read_thread = threading.Thread(target=self._loop_read, daemon=True)
         self.read_thread.start()
 
     def set_handler(self, handler):
         self.handler = handler
+        logging.info(f"[DEBUG-TTY] Handler bound to Worker {self.id}")
 
     def _loop_read(self):
-        """后台线程：同步阻塞读取 PTY 数据"""
+        logging.info("[DEBUG-TTY] Read thread is now running and polling PTY...")
         while not self.closed:
             try:
-                # 阻塞式读取，对 TTY 极其稳定
                 data = os.read(self.fd, 65536)
                 if not data:
+                    logging.info("[DEBUG-TTY] Read EOF (no data) from PTY.")
                     self.loop.add_callback(self.close, 'EOF')
                     break
                 
-                # 只有在前端 WebSocket 连接准备好后才投递数据
+                logging.info(f"[DEBUG-TTY] Read {len(data)} bytes from TTY: {data[:100]}")
+                
                 if self.handler:
                     self.loop.add_callback(self._send_to_client, data)
+                else:
+                    logging.warning("[DEBUG-TTY] Read data from PTY, but no frontend handler is connected yet.")
             except (OSError, IOError) as e:
+                logging.error(f"[DEBUG-TTY] OSError in read thread: {e}")
                 self.loop.add_callback(self.close, f"Read Error: {e}")
                 break
 
     def _send_to_client(self, data):
-        """在 Tornado 主线程中发送 WebSocket 消息"""
         if self.closed or not self.handler:
             return
         try:
-            # 优先使用 text 传输，不兼容时降级为二进制传输
             self.handler.write_message(data.decode(self.encoding, errors='ignore'))
-        except Exception:
+        except Exception as e:
+            logging.debug(f"[DEBUG-TTY] Text send failed, trying binary... Error: {e}")
             try:
                 self.handler.write_message(data, binary=True)
-            except Exception:
-                pass
+            except Exception as e2:
+                logging.error(f"[DEBUG-TTY] Binary send also failed: {e2}")
 
     def write_to_fd(self, data):
-        """写入用户输入到 PTY"""
         if self.closed:
             return
         try:
+            logging.info(f"[DEBUG-TTY] Writing to PTY: {repr(data)}")
             os.write(self.fd, data.encode(self.encoding, errors='ignore'))
         except (OSError, IOError) as e:
+            logging.error(f"[DEBUG-TTY] Write error: {e}")
             self.close(reason=f"Write error: {e}")
 
     def close(self, reason=None):
         if self.closed:
             return
         self.closed = True
-        logging.info(f"Local session {self.id} closed. Reason: {reason}")
+        logging.info(f"[DEBUG-TTY] Closing session {self.id}. Reason: {reason}")
         if self.handler:
             try:
                 self.handler.close(reason=reason)
@@ -313,32 +317,38 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
         return ("localhost", DEFAULT_PORT, "localuser", "", None)
 
     # =====================================================================
-    # 核心修改：以交互式启动本地 Shell 并支持 TERM 环境
+    # 核心修改：以交互式启动本地 Shell 并支持 TERM 环境（加强调试版）
     # =====================================================================
     def ssh_connect(self, args):
-        logging.info("Bypassing SSH. Spawning local interactive shell in container...")
+        logging.info("[DEBUG-POST] Received connect request. Attempting PTY fork...")
         try:
             pid, fd = pty.fork()
             if pid == 0:
-                # 1. 声明终端环境变量以完美支持 xterm.js 的控制序列渲染
+                # 子进程
                 os.environ["TERM"] = "xterm-256color"
                 
-                # 2. 启动交互式 shell (加上 -i 确保它输出 Prompt，比如 user@host:~$)
+                # 寻找可用 shell
+                shell_path = "/bin/bash"
+                if not os.path.exists(shell_path):
+                    shell_path = "/bin/sh"
+                    if not os.path.exists(shell_path):
+                        shell_path = "sh"
+                
                 try:
-                    os.execvp("bash", ["bash", "-i"])
-                except Exception:
-                    try:
-                        os.execvp("sh", ["sh", "-i"])
-                    except Exception as err:
-                        logging.error(f"Failed to execute shells: {err}")
-                        os._exit(1)
+                    # 启动交互式 shell
+                    os.execvp(shell_path, [shell_path, "-i"])
+                except Exception as err:
+                    # 如果 execvp 失败，将错误直接写入 stderr
+                    os.write(2, f"\n[FATAL-SHELL] Exec failed: {err}\n".encode())
+                    os._exit(1)
             else:
-                # 在父进程中不设置 O_NONBLOCK，使得同步后台读取线程能够安全工作
+                # 父进程
+                logging.info(f"[DEBUG-POST] Fork success. Child PID={pid}, FD={fd}")
                 worker = LocalWorker(self.loop, fd, pid)
                 worker.encoding = 'utf-8'
                 return worker
         except Exception as e:
-            logging.error(f"Failed to spawn local shell: {e}")
+            logging.error(f"[DEBUG-POST] Fork failed: {e}")
             raise ValueError(f"Spawn local shell failed: {e}")
 
     def check_origin(self):
@@ -392,6 +402,7 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
             workers[worker.id] = worker
             self.loop.call_later(options.delay, recycle_worker, worker)
             self.result.update(id=worker.id, encoding=worker.encoding)
+            logging.info(f"[DEBUG-POST] Returned Worker ID={worker.id} to frontend.")
 
         self.write(self.result)
 
@@ -404,16 +415,19 @@ class WsockHandler(MixinHandler, tornado.websocket.WebSocketHandler):
 
     def open(self):
         self.src_addr = self.get_client_addr()
-        logging.info('Connected from {}:{}'.format(*self.src_addr))
+        logging.info('[DEBUG-WS] Connected from {}:{}'.format(*self.src_addr))
 
         workers = clients.get(self.src_addr[0])
         if not workers:
+            logging.error("[DEBUG-WS] Websocket authentication failed: No workers found for this IP.")
             self.close(reason='Websocket authentication failed.')
             return
 
         try:
             worker_id = self.get_value('id')
+            logging.info(f"[DEBUG-WS] Handshaking with worker_id={worker_id}")
         except (tornado.web.MissingArgumentError, InvalidValueError) as exc:
+            logging.error(f"[DEBUG-WS] Missing worker_id: {exc}")
             self.close(reason=str(exc))
         else:
             worker = workers.get(worker_id)
@@ -422,19 +436,17 @@ class WsockHandler(MixinHandler, tornado.websocket.WebSocketHandler):
                 self.set_nodelay(True)
                 worker.set_handler(self)
                 self.worker_ref = weakref.ref(worker)
-                # 核心改变：不再使用 loop.add_handler(worker.fd...) 托管给 Tornado，读取由 LocalWorker 自己的后台守护线程完成
+                logging.info("[DEBUG-WS] Handshake established. WebSocket is now bridged to PTY.")
+                
+                # 尝试往 TTY 里面发一个换行，强行触发一次 Shell 的渲染更新
+                worker.write_to_fd("\n")
             else:
+                logging.error("[DEBUG-WS] Websocket authentication failed: Worker ID not match.")
                 self.close(reason='Websocket authentication failed.')
 
     def on_message(self, message):
-        logging.debug('{!r} from {}:{}'.format(message, *self.src_addr))
         worker = self.worker_ref()
         if not worker:
-            logging.debug(
-                "received message to closed worker from {}:{}".format(
-                    *self.src_addr
-                )
-            )
             self.close(reason='No worker found')
             return
 
@@ -459,11 +471,10 @@ class WsockHandler(MixinHandler, tornado.websocket.WebSocketHandler):
 
         data = msg.get('data')
         if data and isinstance(data, UnicodeType):
-            # 核心改变：直接向 PTY 写入
             worker.write_to_fd(data)
 
     def on_close(self):
-        logging.info('Disconnected from {}:{}'.format(*self.src_addr))
+        logging.info('[DEBUG-WS] Disconnected from {}:{}'.format(*self.src_addr))
         if not self.close_reason:
             self.close_reason = 'client disconnected'
 
